@@ -6,10 +6,10 @@ import { CreateRoomModal } from './CreateRoomModal';
 import { InvitePanel } from './InvitePanel';
 import ParticipantList from './ParticipantList';
 import { useInterviewStore, StatusChangeNotification } from '../store/interview';
-import { ParticipantStatus, getRoomStatusConfig, formatDuration, formatTime } from '../types';
-import { getRoomById, updateRoomStatus, getRoomParticipants, heartbeat } from '../services/interviewRoomService';
-import { connect, disconnect, subscribeParticipants, subscribeRoomStatus, sendHeartbeat } from '../services/websocketService';
+import { getRoomStatusConfig, formatDuration, formatTime } from '../types';
+import { getRoomById, updateRoomStatus } from '../services/interviewRoomService';
 import { getProblemById } from '../services/problemService';
+import { useRoomPresence } from '../hooks/useRoomPresence';
 
 export const InterviewerRoomView: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
@@ -19,9 +19,6 @@ export const InterviewerRoomView: React.FC = () => {
     currentUser,
     currentProblem,
     setCurrentRoom,
-    setParticipants,
-    updateParticipant,
-    setIsConnected,
     resetRoom,
     setProblem,
     statusChangeNotification,
@@ -32,12 +29,11 @@ export const InterviewerRoomView: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [duration, setDuration] = useState<string>('');
   const [localStatusNotification, setLocalStatusNotification] = useState<StatusChangeNotification | null>(null);
-  const httpHeartbeatRef = useRef<number | null>(null);
-  const wsHeartbeatRef = useRef<number | null>(null);
-  const unsubscribeParticipantsRef = useRef<(() => void) | null>(null);
-  const unsubscribeRoomStatusRef = useRef<(() => void) | null>(null);
   const durationTimerRef = useRef<number | null>(null);
   const notificationTimerRef = useRef<number | null>(null);
+
+  // 房间在线状态、订阅、心跳、兜底轮询全部由统一 hook 管理（全树一份）
+  useRoomPresence(roomId, currentUser);
 
   const fetchRoomDetails = useCallback(async () => {
     if (!roomId) return;
@@ -53,62 +49,13 @@ export const InterviewerRoomView: React.FC = () => {
     }
   }, [roomId, setCurrentRoom, setProblem]);
 
-  const fetchParticipants = useCallback(async () => {
-    if (!roomId) return;
-    try {
-      const data = await getRoomParticipants(roomId);
-      setParticipants(data);
-    } catch (error) {
-      console.error('Failed to fetch participants:', error);
-    }
-  }, [roomId, setParticipants]);
-
-  const sendHttpHeartbeat = useCallback(async () => {
-    if (!roomId || !currentUser) return;
-    try {
-      const participant = await heartbeat(roomId, currentUser.id);
-      updateParticipant(participant);
-    } catch (error) {
-      console.error('Failed to send heartbeat:', error);
-    }
-  }, [roomId, currentUser, updateParticipant]);
-
   useEffect(() => {
     let mounted = true;
 
     const init = async () => {
       setLoading(true);
       try {
-        if (!currentRoom && roomId) {
-          await fetchRoomDetails();
-        }
-        await fetchParticipants();
-
-        if (currentUser && roomId) {
-          try {
-            await connect(roomId, currentUser);
-            setIsConnected(true);
-
-            unsubscribeParticipantsRef.current = subscribeParticipants(roomId, (data) => {
-              if (mounted) {
-                setParticipants(data as ParticipantStatus[]);
-              }
-            });
-
-            unsubscribeRoomStatusRef.current = subscribeRoomStatus(roomId, (room) => {
-              if (mounted) {
-                setCurrentRoom(room);
-              }
-            });
-
-            httpHeartbeatRef.current = window.setInterval(sendHttpHeartbeat, 30000);
-            wsHeartbeatRef.current = window.setInterval(() => {
-              if (currentUser) sendHeartbeat(roomId, currentUser);
-            }, 30000);
-          } catch (error) {
-            console.error('Failed to connect WebSocket:', error);
-          }
-        }
+        await fetchRoomDetails();
       } catch (error) {
         console.error('Failed to initialize room:', error);
       } finally {
@@ -122,14 +69,8 @@ export const InterviewerRoomView: React.FC = () => {
 
     return () => {
       mounted = false;
-      if (httpHeartbeatRef.current) clearInterval(httpHeartbeatRef.current);
-      if (wsHeartbeatRef.current) clearInterval(wsHeartbeatRef.current);
-      if (unsubscribeParticipantsRef.current) unsubscribeParticipantsRef.current();
-      if (unsubscribeRoomStatusRef.current) unsubscribeRoomStatusRef.current();
-      disconnect();
-      setIsConnected(false);
     };
-  }, [roomId, currentUser, currentRoom, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setIsConnected, setCurrentRoom, setParticipants]);
+  }, [fetchRoomDetails]);
 
   const updateDuration = useCallback(() => {
     if (!currentRoom) return;

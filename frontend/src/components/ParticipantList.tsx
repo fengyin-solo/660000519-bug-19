@@ -1,8 +1,7 @@
-import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { getRoomParticipants, updateRoomStatus, getRoomById, heartbeat } from '../services/interviewRoomService';
-import { subscribeParticipants, sendHeartbeat, connect, disconnect } from '../services/websocketService';
+import React, { useState } from 'react';
+import { updateRoomStatus } from '../services/interviewRoomService';
 import { useInterviewStore } from '../store/interview';
-import { ParticipantStatus, getRoomStatusConfig, formatTime } from '../types';
+import { getRoomStatusConfig, formatTime } from '../types';
 
 const formatTimeAgo = (dateString: string): string => {
   const now = new Date().getTime();
@@ -20,52 +19,42 @@ const formatTimeAgo = (dateString: string): string => {
   return `${days}天前`;
 };
 
-interface JoinedNotification {
-  id: string;
-  name: string;
-}
+const NOTIFICATION_VISIBLE_MS = 3000;
 
 interface ParticipantListProps {
   roomId: string;
 }
 
-const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
-  const { currentUser, participants, setParticipants, currentRoom, setCurrentRoom, invitations } = useInterviewStore();
+const ParticipantList: React.FC<ParticipantListProps> = () => {
+  const {
+    currentUser,
+    participants,
+    currentRoom,
+    setCurrentRoom,
+    invitations,
+    candidateJoinNotification,
+    dismissCandidateJoinNotification,
+  } = useInterviewStore();
   const [copied, setCopied] = useState(false);
-  const [joinedNotification, setJoinedNotification] = useState<JoinedNotification | null>(null);
-  const prevParticipantsRef = useRef<ParticipantStatus[]>([]);
-  const notificationTimerRef = useRef<number | null>(null);
+  const [notificationVisible, setNotificationVisible] = useState<string | null>(null);
 
-  const fetchParticipants = useCallback(async () => {
-    try {
-      const data = await getRoomParticipants(roomId);
-      setParticipants(data);
-    } catch (error) {
-      console.error('Failed to fetch participants:', error);
+  // 同一通知展示 3s 后自动消失；后续参与者快照变化不会刷新/重弹这条通知
+  React.useEffect(() => {
+    if (!candidateJoinNotification) {
+      return;
     }
-  }, [roomId, setParticipants]);
-
-  const fetchRoomDetails = useCallback(async () => {
-    try {
-      const data = await getRoomById(roomId);
-      setCurrentRoom(data);
-    } catch (error) {
-      console.error('Failed to fetch room details:', error);
-    }
-  }, [roomId, setCurrentRoom]);
-
-  const sendHttpHeartbeat = useCallback(async () => {
-    if (!currentUser) return;
-    try {
-      await heartbeat(roomId, currentUser.id);
-    } catch (error) {
-      console.error('Failed to send heartbeat:', error);
-    }
-  }, [roomId, currentUser]);
+    setNotificationVisible(candidateJoinNotification.id);
+    const timer = window.setTimeout(() => {
+      setNotificationVisible(null);
+      dismissCandidateJoinNotification();
+    }, NOTIFICATION_VISIBLE_MS);
+    return () => window.clearTimeout(timer);
+  }, [candidateJoinNotification, dismissCandidateJoinNotification]);
 
   const handleStartInterview = async () => {
+    if (!currentRoom) return;
     try {
-      const updatedRoom = await updateRoomStatus(roomId, 'ACTIVE');
+      const updatedRoom = await updateRoomStatus(currentRoom.id, 'ACTIVE');
       setCurrentRoom(updatedRoom);
     } catch (error) {
       console.error('Failed to start interview:', error);
@@ -73,8 +62,9 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
   };
 
   const handleEndInterview = async () => {
+    if (!currentRoom) return;
     try {
-      const updatedRoom = await updateRoomStatus(roomId, 'COMPLETED');
+      const updatedRoom = await updateRoomStatus(currentRoom.id, 'COMPLETED');
       setCurrentRoom(updatedRoom);
     } catch (error) {
       console.error('Failed to end interview:', error);
@@ -93,68 +83,11 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
   };
 
   const handleCloseNotification = () => {
-    setJoinedNotification(null);
-    if (notificationTimerRef.current) {
-      clearTimeout(notificationTimerRef.current);
-      notificationTimerRef.current = null;
-    }
+    setNotificationVisible(null);
+    dismissCandidateJoinNotification();
   };
 
-  useEffect(() => {
-    const prevParticipants = prevParticipantsRef.current;
-    const currentParticipants = participants;
-
-    if (prevParticipants.length > 0 && currentParticipants.length > 0) {
-      const prevCandidateIds = new Set(
-        prevParticipants
-          .filter((p) => p.userRole === 'CANDIDATE' && p.isOnline)
-          .map((p) => p.userId)
-      );
-
-      const newOnlineCandidates = currentParticipants.filter(
-        (p) => p.userRole === 'CANDIDATE' && p.isOnline && !prevCandidateIds.has(p.userId)
-      );
-
-      if (newOnlineCandidates.length > 0) {
-        const candidate = newOnlineCandidates[0];
-        setJoinedNotification({ id: candidate.id, name: candidate.userName });
-
-        if (notificationTimerRef.current) {
-          clearTimeout(notificationTimerRef.current);
-        }
-        notificationTimerRef.current = setTimeout(() => {
-          setJoinedNotification(null);
-          notificationTimerRef.current = null;
-        }, 3000);
-      }
-    } else if (prevParticipants.length === 0 && currentParticipants.length > 0) {
-      const onlineCandidates = currentParticipants.filter(
-        (p) => p.userRole === 'CANDIDATE' && p.isOnline
-      );
-      if (onlineCandidates.length > 0) {
-        const candidate = onlineCandidates[0];
-        setJoinedNotification({ id: candidate.id, name: candidate.userName });
-
-        if (notificationTimerRef.current) {
-          clearTimeout(notificationTimerRef.current);
-        }
-        notificationTimerRef.current = setTimeout(() => {
-          setJoinedNotification(null);
-          notificationTimerRef.current = null;
-        }, 3000);
-      }
-    }
-
-    prevParticipantsRef.current = currentParticipants;
-
-    return () => {
-      if (notificationTimerRef.current) {
-        clearTimeout(notificationTimerRef.current);
-      }
-    };
-  }, [participants]);
-
-  const getInvitationForParticipant = (participant: ParticipantStatus) => {
+  const getInvitationForParticipant = (participant: { userName: string }) => {
     return invitations.find(
       (inv) => inv.candidateEmail === participant.userName || inv.candidateName === participant.userName
     );
@@ -167,60 +100,8 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
   };
 
   const isInterviewer = currentUser?.role === 'INTERVIEWER';
-
-  useEffect(() => {
-    let mounted = true;
-
-    const init = async () => {
-      await Promise.all([fetchParticipants(), fetchRoomDetails()]);
-      
-      if (currentUser) {
-        try {
-          await connect(roomId, currentUser);
-        } catch (error) {
-          console.error('WebSocket connection failed:', error);
-        }
-      }
-    };
-
-    init();
-
-    const pollInterval = setInterval(() => {
-      if (mounted) {
-        fetchParticipants();
-        fetchRoomDetails();
-      }
-    }, 2000);
-
-    const heartbeatInterval = setInterval(() => {
-      if (mounted) {
-        sendHttpHeartbeat();
-        if (currentUser) {
-          sendHeartbeat(roomId, currentUser);
-        }
-      }
-    }, 30000);
-
-    let unsubscribe: (() => void) | null = null;
-    const setupSubscription = () => {
-      unsubscribe = subscribeParticipants(roomId, (data) => {
-        if (mounted) {
-          setParticipants(data);
-        }
-      });
-    };
-    setTimeout(setupSubscription, 1000);
-
-    return () => {
-      mounted = false;
-      clearInterval(pollInterval);
-      clearInterval(heartbeatInterval);
-      if (unsubscribe) {
-        unsubscribe();
-      }
-      disconnect();
-    };
-  }, [roomId, currentUser, fetchParticipants, fetchRoomDetails, sendHttpHeartbeat, setParticipants]);
+  const showNotification = candidateJoinNotification
+    && notificationVisible === candidateJoinNotification.id;
 
   return (
     <>
@@ -278,7 +159,7 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
         }
       `}</style>
 
-      {joinedNotification && (
+      {showNotification && (
         <div
           className="notification-bar"
           style={{
@@ -301,7 +182,7 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
           }}
         >
           <span style={{ flex: 1 }}>
-            候选人 {joinedNotification.name} 已加入面试
+            候选人 {candidateJoinNotification.name} 已加入面试
           </span>
           <button
             onClick={handleCloseNotification}
@@ -457,7 +338,7 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
 
               return (
                 <div
-                  key={participant.id}
+                  key={participant.userId}
                   className={isCandidate && isOnline ? 'candidate-card-online' : ''}
                   style={{
                     padding: '12px',
@@ -539,7 +420,7 @@ const ParticipantList: React.FC<ParticipantListProps> = ({ roomId }) => {
                     <span>最后活跃: {formatTime(participant.lastHeartbeat)}</span>
                     {invitation && (
                       <span>
-                        邀请状态: 
+                        邀请状态:
                         <span style={{
                           color: invitation.status === 'JOINED' ? '#4caf50' : '#ff9800',
                           marginLeft: '4px',

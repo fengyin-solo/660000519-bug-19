@@ -13,6 +13,8 @@ import java.util.Optional;
 public interface ParticipantStatusRepository extends JpaRepository<ParticipantStatus, String> {
     List<ParticipantStatus> findByRoomId(String roomId);
     Optional<ParticipantStatus> findByRoomIdAndUserId(String roomId, String userId);
+    Optional<ParticipantStatus> findFirstByRoomIdAndUserRoleAndUserNameOrderByJoinedAtAsc(
+            String roomId, String userRole, String userName);
     @Modifying
     @Transactional
     void deleteByRoomIdAndUserId(String roomId, String userId);

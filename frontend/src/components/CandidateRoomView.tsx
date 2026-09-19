@@ -1,12 +1,12 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { getRoomById, getRoomParticipants, heartbeat } from '../services/interviewRoomService';
-import { connect, disconnect, subscribeParticipants, subscribeRoomStatus, sendHeartbeat } from '../services/websocketService';
+import { getRoomById } from '../services/interviewRoomService';
 import { useInterviewStore, StatusChangeNotification } from '../store/interview';
 import { ProblemPanel } from './ProblemPanel';
 import { CodeEditor } from './CodeEditor';
-import { ParticipantStatus, getRoomStatusConfig, formatDuration, formatTime } from '../types';
+import { getRoomStatusConfig, formatDuration, formatTime } from '../types';
 import { getProblemById } from '../services/problemService';
+import { useRoomPresence } from '../hooks/useRoomPresence';
 
 const CandidateRoomView: React.FC = () => {
   const { roomId } = useParams<{ roomId: string }>();
@@ -17,8 +17,6 @@ const CandidateRoomView: React.FC = () => {
     currentProblem,
     participants,
     setCurrentRoom,
-    setParticipants,
-    updateParticipant,
     resetRoom,
     setProblem,
     statusChangeNotification,
@@ -36,6 +34,9 @@ const CandidateRoomView: React.FC = () => {
   const durationTimerRef = useRef<number | null>(null);
   const notificationTimerRef = useRef<number | null>(null);
 
+  // 房间在线状态、订阅、心跳、兜底轮询全部由统一 hook 管理（全树一份）
+  useRoomPresence(roomId, currentUser);
+
   const fetchRoomDetails = useCallback(async () => {
     if (!roomId) return;
     try {
@@ -50,25 +51,26 @@ const CandidateRoomView: React.FC = () => {
     }
   }, [roomId, setCurrentRoom, setProblem]);
 
-  const fetchParticipants = useCallback(async () => {
-    if (!roomId) return;
-    try {
-      const data = await getRoomParticipants(roomId);
-      setParticipants(data);
-    } catch (error) {
-      console.error('Failed to fetch participants:', error);
-    }
-  }, [roomId, setParticipants]);
+  useEffect(() => {
+    let mounted = true;
 
-  const sendHttpHeartbeat = useCallback(async () => {
-    if (!roomId || !currentUser) return;
-    try {
-      const participant = await heartbeat(roomId, currentUser.id);
-      updateParticipant(participant);
-    } catch (error) {
-      console.error('Failed to send heartbeat:', error);
-    }
-  }, [roomId, currentUser, updateParticipant]);
+    const init = async () => {
+      setLoading(true);
+      try {
+        await fetchRoomDetails();
+      } finally {
+        if (mounted) {
+          setLoading(false);
+        }
+      }
+    };
+
+    init();
+
+    return () => {
+      mounted = false;
+    };
+  }, [fetchRoomDetails]);
 
   const updateDuration = useCallback(() => {
     if (!currentRoom) return;
@@ -167,84 +169,6 @@ const CandidateRoomView: React.FC = () => {
   }, [isDragging, minPanelWidth, maxPanelWidth]);
 
   const onlineCount = participants.filter(p => p.isOnline).length;
-
-  useEffect(() => {
-    let mounted = true;
-
-    const init = async () => {
-      setLoading(true);
-      try {
-        if (!currentRoom && roomId) {
-          await fetchRoomDetails();
-        }
-        await fetchParticipants();
-
-        if (currentUser && roomId) {
-          try {
-            await connect(roomId, currentUser);
-          } catch (error) {
-            console.error('WebSocket connection failed:', error);
-          }
-        }
-      } finally {
-        if (mounted) {
-          setLoading(false);
-        }
-      }
-    };
-
-    init();
-
-    const pollInterval = setInterval(() => {
-      if (mounted) {
-        fetchParticipants();
-        fetchRoomDetails();
-      }
-    }, 2000);
-
-    const heartbeatInterval = setInterval(() => {
-      if (mounted) {
-        sendHttpHeartbeat();
-        if (currentUser && roomId) {
-          sendHeartbeat(roomId, currentUser);
-        }
-      }
-    }, 30000);
-
-    let unsubscribeParticipants: (() => void) | null = null;
-    let unsubscribeRoomStatus: (() => void) | null = null;
-
-    const setupSubscriptions = () => {
-      if (roomId) {
-        unsubscribeParticipants = subscribeParticipants(roomId, (data) => {
-          if (mounted) {
-            setParticipants(data);
-          }
-        });
-
-        unsubscribeRoomStatus = subscribeRoomStatus(roomId, (data) => {
-          if (mounted) {
-            setCurrentRoom(data);
-          }
-        });
-      }
-    };
-
-    setTimeout(setupSubscriptions, 1000);
-
-    return () => {
-      mounted = false;
-      clearInterval(pollInterval);
-      clearInterval(heartbeatInterval);
-      if (unsubscribeParticipants) {
-        unsubscribeParticipants();
-      }
-      if (unsubscribeRoomStatus) {
-        unsubscribeRoomStatus();
-      }
-      disconnect();
-    };
-  }, [roomId, currentUser, currentRoom, fetchRoomDetails, fetchParticipants, sendHttpHeartbeat, setCurrentRoom, setParticipants]);
 
   if (loading) {
     return (
@@ -683,13 +607,13 @@ const CandidateRoomView: React.FC = () => {
             </button>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-            {participants.map((participant: ParticipantStatus) => {
+            {participants.map((participant) => {
               const isSelf = currentUser && participant.userId === currentUser.id;
               const isInterviewer = participant.userRole === 'INTERVIEWER';
 
               return (
                 <div
-                  key={participant.id}
+                  key={participant.userId}
                   style={{
                     padding: '10px',
                     backgroundColor: isSelf ? '#2a3f4f' : '#2a2a2a',

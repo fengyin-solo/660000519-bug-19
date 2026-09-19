@@ -1,7 +1,6 @@
 package com.codeinterview.config;
 
-import com.codeinterview.model.ParticipantStatus;
-import com.codeinterview.repository.ParticipantStatusRepository;
+import com.codeinterview.service.ParticipantPresenceService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,17 +10,23 @@ import org.springframework.stereotype.Component;
 import org.springframework.web.socket.messaging.SessionConnectEvent;
 import org.springframework.web.socket.messaging.SessionDisconnectEvent;
 
-import java.time.LocalDateTime;
 import java.util.Map;
-import java.util.Optional;
 
+/**
+ * WebSocket 会话事件处理。
+ *
+ * 网络波动时 SockJS/STOMP 可能频繁断开重连，因此 DISCONNECT 事件不立即将成员
+ * 标记离线，而是由 {@link ParticipantPresenceService#sweepStaleParticipants()}
+ * 在宽限期（45s）后统一处理；重连后的首次心跳/连接事件会立刻复活记录，
+ * 整个过程中参与者不会"先消失再出现"，加入通知也只在真实变化时产生一次。
+ */
 @Component
 public class WebSocketEventListener {
 
     private static final Logger logger = LoggerFactory.getLogger(WebSocketEventListener.class);
 
     @Autowired
-    private ParticipantStatusRepository participantStatusRepository;
+    private ParticipantPresenceService presenceService;
 
     @EventListener
     public void handleWebSocketConnectListener(SessionConnectEvent event) {
@@ -49,32 +54,14 @@ public class WebSocketEventListener {
         logger.info("WebSocket connected - roomId: {}, userId: {}, userName: {}, userRole: {}",
                 roomId, userId, userName, userRole);
 
-        if (roomId != null && userId != null) {
-            if (attributes != null) {
-                attributes.put("roomId", roomId);
-                attributes.put("userId", userId);
-                attributes.put("userName", userName);
-                attributes.put("userRole", userRole);
-            }
-
-            Optional<ParticipantStatus> existing = participantStatusRepository.findByRoomIdAndUserId(roomId, userId);
-            ParticipantStatus status;
-            if (existing.isPresent()) {
-                status = existing.get();
-                status.setOnline(true);
-                status.setLastHeartbeat(LocalDateTime.now());
-            } else {
-                status = new ParticipantStatus();
-                status.setRoomId(roomId);
-                status.setUserId(userId);
-                status.setUserName(userName);
-                status.setUserRole(userRole);
-                status.setOnline(true);
-                status.setJoinedAt(LocalDateTime.now());
-                status.setLastHeartbeat(LocalDateTime.now());
-            }
-            participantStatusRepository.save(status);
+        if (attributes != null) {
+            if (roomId != null) attributes.put("roomId", roomId);
+            if (userId != null) attributes.put("userId", userId);
+            if (userName != null) attributes.put("userName", userName);
+            if (userRole != null) attributes.put("userRole", userRole);
         }
+
+        presenceService.markOnline(roomId, userId, userName, userRole);
     }
 
     @EventListener
@@ -82,26 +69,12 @@ public class WebSocketEventListener {
         SimpMessageHeaderAccessor headerAccessor = SimpMessageHeaderAccessor.wrap(event.getMessage());
         Map<String, Object> attributes = headerAccessor.getSessionAttributes();
 
-        String roomId = headerAccessor.getFirstNativeHeader("roomId");
-        String userId = headerAccessor.getFirstNativeHeader("userId");
+        String roomId = attributes == null ? null : (String) attributes.get("roomId");
+        String userId = attributes == null ? null : (String) attributes.get("userId");
 
-        if (roomId == null && attributes != null) {
-            roomId = (String) attributes.get("roomId");
-        }
-        if (userId == null && attributes != null) {
-            userId = (String) attributes.get("userId");
-        }
-
-        logger.info("WebSocket disconnected - roomId: {}, userId: {}", roomId, userId);
-
-        if (roomId != null && userId != null) {
-            Optional<ParticipantStatus> existing = participantStatusRepository.findByRoomIdAndUserId(roomId, userId);
-            if (existing.isPresent()) {
-                ParticipantStatus status = existing.get();
-                status.setOnline(false);
-                status.setLastHeartbeat(LocalDateTime.now());
-                participantStatusRepository.save(status);
-            }
-        }
+        // 仅记录日志，不立即标记离线。心跳宽限期到期后 sweep 任务才真正下线，
+        // 重连会通过连接/心跳事件即时复活，避免短暂断线导致的状态抖动。
+        logger.info("WebSocket disconnected (grace period applies) - roomId: {}, userId: {}",
+                roomId, userId);
     }
 }

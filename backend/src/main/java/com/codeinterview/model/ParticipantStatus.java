@@ -4,7 +4,13 @@ import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "participant_statuses")
+@Table(
+    name = "participant_statuses",
+    uniqueConstraints = @UniqueConstraint(
+        name = "uk_participant_room_user",
+        columnNames = {"roomId", "userId"}
+    )
+)
 public class ParticipantStatus {
     @Id @GeneratedValue(strategy = GenerationType.UUID)
     private String id;
@@ -15,9 +21,6 @@ public class ParticipantStatus {
     private boolean isOnline;
     private LocalDateTime lastHeartbeat;
     private LocalDateTime joinedAt;
-
-    @Transient
-    private transient String unifiedUserId;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -35,12 +38,4 @@ public class ParticipantStatus {
     public void setLastHeartbeat(LocalDateTime lastHeartbeat) { this.lastHeartbeat = lastHeartbeat; }
     public LocalDateTime getJoinedAt() { return joinedAt; }
     public void setJoinedAt(LocalDateTime joinedAt) { this.joinedAt = joinedAt; }
-
-    public String getUnifiedUserId() {
-        return this.id;
-    }
-
-    public void setUnifiedUserId(String unifiedUserId) {
-        this.unifiedUserId = unifiedUserId;
-    }
 }

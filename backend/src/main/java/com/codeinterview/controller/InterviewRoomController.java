@@ -8,7 +8,7 @@ import com.codeinterview.model.InterviewRoom;
 import com.codeinterview.model.ParticipantStatus;
 import com.codeinterview.repository.CandidateInvitationRepository;
 import com.codeinterview.repository.InterviewRoomRepository;
-import com.codeinterview.repository.ParticipantStatusRepository;
+import com.codeinterview.service.ParticipantPresenceService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.http.HttpStatus;
@@ -16,6 +16,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -34,7 +36,7 @@ public class InterviewRoomController {
     private CandidateInvitationRepository candidateInvitationRepository;
 
     @Autowired
-    private ParticipantStatusRepository participantStatusRepository;
+    private ParticipantPresenceService presenceService;
 
     @Autowired
     private SimpMessagingTemplate messagingTemplate;
@@ -60,17 +62,10 @@ public class InterviewRoomController {
 
         InterviewRoom savedRoom = interviewRoomRepository.save(room);
 
-        ParticipantStatus interviewerStatus = new ParticipantStatus();
-        interviewerStatus.setRoomId(savedRoom.getId());
-        interviewerStatus.setUserId(interviewerId);
-        interviewerStatus.setUserName(interviewerName);
-        interviewerStatus.setUserRole("INTERVIEWER");
-        interviewerStatus.setOnline(true);
-        interviewerStatus.setLastHeartbeat(LocalDateTime.now());
-        interviewerStatus.setJoinedAt(LocalDateTime.now());
-        ParticipantStatus savedInterviewerStatus = participantStatusRepository.save(interviewerStatus);
+        ParticipantStatus interviewerStatus = presenceService.markOnline(
+                savedRoom.getId(), interviewerId, interviewerName, "INTERVIEWER");
 
-        return new ResponseEntity<>(new CreateRoomResponse(savedRoom, savedInterviewerStatus), HttpStatus.CREATED);
+        return new ResponseEntity<>(new CreateRoomResponse(savedRoom, interviewerStatus), HttpStatus.CREATED);
     }
 
     @GetMapping("/{roomId}")
@@ -113,13 +108,17 @@ public class InterviewRoomController {
         }
 
         InterviewRoom updatedRoom = interviewRoomRepository.save(room);
+
+        // 通知所有订阅者（候选人、面试官）房间状态已变化
+        messagingTemplate.convertAndSend("/topic/room/" + roomId + "/status",
+                new WebSocketMessage<>("ROOM_STATUS", updatedRoom));
+
         return new ResponseEntity<>(updatedRoom, HttpStatus.OK);
     }
 
     @GetMapping("/{roomId}/participants")
     public ResponseEntity<List<ParticipantStatus>> getRoomParticipants(@PathVariable String roomId) {
-        List<ParticipantStatus> participants = participantStatusRepository.findByRoomId(roomId);
-        return new ResponseEntity<>(participants, HttpStatus.OK);
+        return new ResponseEntity<>(presenceService.listParticipants(roomId), HttpStatus.OK);
     }
 
     @PostMapping("/{roomId}/join")
@@ -136,6 +135,9 @@ public class InterviewRoomController {
 
         String message = "Joined via room code";
 
+        // 派生稳定身份：邀请链接用邀请ID，保证掉线重进与刷新后都是同一成员；
+        // 房间码加入用"房间+姓名"派生，同一候选人再次加入仍合并为同一行。
+        String stableUserId;
         if (inviteToken != null && !inviteToken.trim().isEmpty()) {
             Optional<CandidateInvitation> invitationOpt = candidateInvitationRepository.findByInviteToken(inviteToken);
             if (invitationOpt.isEmpty()) {
@@ -147,29 +149,22 @@ public class InterviewRoomController {
                 return new ResponseEntity<>(HttpStatus.BAD_REQUEST);
             }
 
-            invitation.setStatus("JOINED");
-            invitation.setJoinedAt(LocalDateTime.now());
-            candidateInvitationRepository.save(invitation);
+            if (!"JOINED".equals(invitation.getStatus())) {
+                invitation.setStatus("JOINED");
+                invitation.setJoinedAt(LocalDateTime.now());
+                candidateInvitationRepository.save(invitation);
+            }
+            stableUserId = "candidate-inv-" + invitation.getId();
             message = "Joined via invitation token";
+        } else {
+            stableUserId = "candidate-code-" + shortHash(roomId + ":" + candidateName.trim().toLowerCase());
         }
 
-        ParticipantStatus candidateStatus = new ParticipantStatus();
-        candidateStatus.setRoomId(roomId);
-        candidateStatus.setUserName(candidateName);
-        candidateStatus.setUserRole("CANDIDATE");
-        candidateStatus.setOnline(true);
-        candidateStatus.setLastHeartbeat(LocalDateTime.now());
-        candidateStatus.setJoinedAt(LocalDateTime.now());
-        ParticipantStatus savedStatus = participantStatusRepository.save(candidateStatus);
+        // 幂等加入：已有记录直接复活并保留原始 joinedAt，仅真实上线时广播一次
+        ParticipantStatus candidateStatus = presenceService.joinCandidate(
+                roomId, candidateName, "CANDIDATE", stableUserId);
 
-        savedStatus.setUserId(savedStatus.getId());
-        participantStatusRepository.save(savedStatus);
-
-        List<ParticipantStatus> participants = participantStatusRepository.findByRoomId(roomId);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId + "/participants",
-                new WebSocketMessage<>("PARTICIPANTS_UPDATE", participants));
-
-        JoinRoomResponse response = new JoinRoomResponse(savedStatus, room, message);
+        JoinRoomResponse response = new JoinRoomResponse(candidateStatus, room, message);
         return new ResponseEntity<>(response, HttpStatus.OK);
     }
 
@@ -178,19 +173,12 @@ public class InterviewRoomController {
     public ResponseEntity<Void> leaveRoom(@PathVariable String roomId, @RequestBody Map<String, String> request) {
         String userId = request.get("userId");
 
-        Optional<ParticipantStatus> statusOpt = participantStatusRepository.findByRoomIdAndUserId(roomId, userId);
-        if (statusOpt.isEmpty()) {
+        if (userId == null || presenceService.listParticipants(roomId).stream()
+                .noneMatch(p -> userId.equals(p.getUserId()))) {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }
 
-        ParticipantStatus status = statusOpt.get();
-        status.setOnline(false);
-        participantStatusRepository.save(status);
-
-        List<ParticipantStatus> participants = participantStatusRepository.findByRoomId(roomId);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId + "/participants",
-                new WebSocketMessage<>("PARTICIPANTS_UPDATE", participants));
-
+        presenceService.markLeft(roomId, userId);
         return new ResponseEntity<>(HttpStatus.OK);
     }
 
@@ -198,22 +186,30 @@ public class InterviewRoomController {
     @Transactional
     public ResponseEntity<ParticipantStatus> heartbeat(@PathVariable String roomId, @RequestBody Map<String, String> request) {
         String userId = request.get("userId");
+        String userName = request.get("userName");
+        String userRole = request.get("userRole");
 
-        Optional<ParticipantStatus> statusOpt = participantStatusRepository.findByRoomIdAndUserId(roomId, userId);
-        if (statusOpt.isEmpty()) {
+        // markOnline 内部处理了"记录不存在则创建"，断网后心跳恢复也能即时复活；
+        // 普通心跳不广播，避免风暴
+        ParticipantStatus updatedStatus = presenceService.markOnline(roomId, userId, userName, userRole);
+        if (updatedStatus == null) {
             return new ResponseEntity<>(HttpStatus.NOT_FOUND);
         }
-
-        ParticipantStatus status = statusOpt.get();
-        status.setOnline(true);
-        status.setLastHeartbeat(LocalDateTime.now());
-        ParticipantStatus updatedStatus = participantStatusRepository.save(status);
-
-        List<ParticipantStatus> participants = participantStatusRepository.findByRoomId(roomId);
-        messagingTemplate.convertAndSend("/topic/room/" + roomId + "/participants",
-                new WebSocketMessage<>("PARTICIPANTS_UPDATE", participants));
-
         return new ResponseEntity<>(updatedStatus, HttpStatus.OK);
+    }
+
+    private String shortHash(String input) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder();
+            for (int i = 0; i < 8 && i < hash.length; i++) {
+                hex.append(String.format("%02x", hash[i]));
+            }
+            return hex.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(input.hashCode());
+        }
     }
 
     private String generateUniqueRoomCode() {
